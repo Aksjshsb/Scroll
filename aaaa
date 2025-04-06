@@ -1,0 +1,529 @@
+import ctypes
+try: ctypes.windll.shcore.SetProcessDpiAwareness(1)
+except AttributeError:
+    try: ctypes.windll.user32.SetProcessDPIAware()
+    except AttributeError: print("[WARN] DPI awareness failed.")
+
+import time
+import threading
+import numpy as np
+from PIL import Image, ImageGrab 
+import keyboard
+import interception
+import cv2
+from sklearn.cluster import KMeans
+import os, sys
+import traceback
+
+import tkinter as tk
+import tkinter.font as tkFont
+from tkinter import filedialog, messagebox
+import tkinter.ttk as ttk
+
+class OlegPainter:
+
+    DRAW_DELAY = 0.001  
+    K_CLUSTERS = 25     
+    BRUSH_SIZE = 2      
+
+    IMAGE_PATH = r""
+
+    def __init__(self, status_callback=None, pixel_update_callback=None):
+        self.draw_region = None; self.stop_flag = False; self.drawing_enabled = False
+        self.color_palette = []; self.current_color_index = 0
+        self.drawn_mask = None; self.cluster_map = None; self.image_rgb = None 
+        self.drawing_thread = None
+        self.status_callback = status_callback
+        self.pixel_update_callback = pixel_update_callback
+
+        self.mode = "color"
+        try:
+            sw = ctypes.windll.user32.GetSystemMetrics(0); sh = ctypes.windll.user32.GetSystemMetrics(1)
+        except Exception as e: print(f"[WARN] Screen metrics error: {e}"); sw, sh = 1920, 1080
+        self.HEX_INPUT_COORD = (int(0.0625*sw + 85), int(sh - 94))
+        self._log(f"Расчетные координаты HEX поля: {self.HEX_INPUT_COORD}")
+        self.neighbor_order = "36184527"
+        self.neighbor_mapping = {'1':(-1,-1),'2':(-1,0),'3':(-1,1),'4':(0,-1),'5':(0,1),'6':(1,-1),'7':(1,0),'8':(1,1)}
+        try:
+            interception.auto_capture_devices(mouse=True, keyboard=False)
+            self._log("Мышь успешно захвачена через Interception.")
+        except Exception as e: self._log(f"Ошибка инициализации Interception: {e}. Проверьте драйвер и права.", True)
+
+    def _log(self, message, is_error=False):
+        prefix = "[ERROR] " if is_error else "[INFO] "; full_message = prefix + str(message); print(full_message)
+        if self.status_callback:
+            try: self.status_callback(full_message)
+            except Exception as e: print(f"[WARN] Status callback failed: {e}")
+
+    def preprocess_image(self, img): return cv2.GaussianBlur(img, (5, 5), 0)
+
+    def select_area(self):
+        if self.drawing_enabled: self._log("Нельзя выбрать область во время рисования.", True); self.status_callback("Ошибка: Рисование активно."); return
+        self._log("Выбор области..."); self.status_callback("Запустите выбор области (Enter/C)")
+        try:
+            screenshot = ImageGrab.grab(all_screens=True); img = np.array(screenshot); img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            window_title = "Выберите область (Enter - подтвердить, C - отмена)"
+            cv2.namedWindow(window_title, cv2.WINDOW_NORMAL); cv2.setWindowProperty(window_title, cv2.WND_PROP_TOPMOST, 1)
+            roi = cv2.selectROI(window_title, img, showCrosshair=True, fromCenter=False); cv2.destroyWindow(window_title)
+            x, y, w, h = roi
+        except Exception as e: self._log(f"Ошибка выбора области: {e}", True); self.status_callback(f"Ошибка выбора: {e}"); return
+        if w > 0 and h > 0:
+            self.draw_region = (int(x), int(y), int(w), int(h)); self._log(f"Область выбрана: {self.draw_region}")
+            self.status_callback(f"Область: ({x},{y}) {w}x{h}")
+            if self.IMAGE_PATH: self.prepare_image_and_palette() 
+            else: self._log("Изображение не выбрано."); self.status_callback("Область выбрана. Выберите изображение.")
+        else: self._log("Выбор области отменен."); self.status_callback("Выбор области отменен."); self.draw_region = None
+
+    def prepare_image_and_palette(self):
+        if self.drawing_enabled: self._log("Нельзя изменить параметры во время рисования.", True); return False
+        if self.draw_region is None: self._log("Область не выбрана.", True); return False
+        if not self.IMAGE_PATH or not os.path.exists(self.IMAGE_PATH):
+            self._log("Файл изображения не найден.", True); self.status_callback("Ошибка: Файл не найден.")
+
+            self.image_rgb = None; self.cluster_map = None; self.drawn_mask = None; self.color_palette = []
+
+            if self.pixel_update_callback: self.pixel_update_callback()
+            return False
+
+        self._log("Подготовка изображения и палитры..."); self.status_callback("Обработка изображения...")
+        start_time = time.time(); success = False
+
+        try:
+            if not isinstance(self.draw_region, (tuple, list)) or len(self.draw_region) != 4:
+                raise ValueError(f"Некорректный формат draw_region: {self.draw_region}")
+            x, y, w, h = self.draw_region
+            if w <= 0 or h <= 0:
+                raise ValueError(f"Некорректные размеры области: w={w}, h={h}")
+        except Exception as e:
+            self._log(f"Ошибка в данных области рисования ({self.draw_region}): {e}", True)
+            self.status_callback(f"Ошибка области: {e}")
+            self.image_rgb = None; self.cluster_map = None; self.drawn_mask = None; self.color_palette = []
+
+            if self.pixel_update_callback: self.pixel_update_callback()
+            return False
+
+        try:
+            img = Image.open(self.IMAGE_PATH)
+            img = img.resize((w, h), Image.LANCZOS)
+            w_brush = max(1, w // self.BRUSH_SIZE) 
+            h_brush = max(1, h // self.BRUSH_SIZE) 
+            self._log(f"Размер карты кластеров: {w_brush}x{h_brush}")
+
+            self.color_palette = []
+            self.image_rgb = None 
+            self.cluster_map = None
+            self.drawn_mask = None
+
+            if self.mode == "bw":
+                img_small = img.resize((w_brush, h_brush), Image.LANCZOS).convert("L")
+                np_gray = np.array(img_small)
+                ret, thresh = cv2.threshold(np_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+                self.cluster_map = (thresh == 0).astype(np.uint8)
+                count_black = np.count_nonzero(self.cluster_map == 1)
+                count_white = self.cluster_map.size - count_black
+                self.color_palette = []
+                if count_black > 0: self.color_palette.append(("#000000", 1, count_black, (0, 0, 0)))
+                if count_white > 0: self.color_palette.append(("#FFFFFF", 0, count_white, (255, 255, 255)))
+                if self.color_palette: self._log("Палитра BW создана:")
+                else: self._log("Палитра BW пуста.")
+
+            else: 
+                img_small = img.resize((w_brush, h_brush), Image.LANCZOS).convert("RGB")
+                np_img = np.array(img_small)
+                processed = self.preprocess_image(np_img)
+
+                reshaped = processed.reshape(-1, 3); unique_pixels = np.unique(reshaped, axis=0)
+
+                k_actual = min(self.K_CLUSTERS, len(unique_pixels))
+
+                if k_actual < 1: raise ValueError("Нет пикселей для кластеризации.")
+                self._log(f"Запуск KMeans с k={k_actual}...")
+                kmeans = KMeans(n_clusters=k_actual, random_state=42, n_init='auto'); labels = kmeans.fit_predict(reshaped)
+                centers = kmeans.cluster_centers_.astype(int); counts = np.bincount(labels, minlength=k_actual)
+                temp_palette = []
+                for cluster_id in range(k_actual):
+                    if counts[cluster_id] > 0:
+                        center_color = centers[cluster_id]; hex_color = "#{:02X}{:02X}{:02X}".format(center_color[0], center_color[1], center_color[2])
+                        temp_palette.append({"hex": hex_color, "id": cluster_id, "count": counts[cluster_id], "rgb": tuple(center_color)})
+                sorted_palette = sorted(temp_palette, key=lambda x: x["count"], reverse=True)
+                self.color_palette = [(p["hex"], p["id"], p["count"], p["rgb"]) for p in sorted_palette]
+                if not self.color_palette: raise ValueError("Палитра пуста после фильтрации.")
+                self._log("Палитра создана:");
+                self.cluster_map = labels.reshape(h_brush, w_brush)
+
+            if self.cluster_map is not None:
+                self.drawn_mask = np.zeros(self.cluster_map.shape, dtype=bool)
+            else:
+                self.drawn_mask = None
+
+            self.current_color_index = 0
+            success = True
+        except Exception as e:
+            self._log(f"Ошибка обработки: {e}", True); traceback.print_exc()
+            self.status_callback(f"Ошибка обработки: {e}")
+            self.image_rgb=None; self.cluster_map=None; self.drawn_mask=None; self.color_palette=[]
+            success = False
+        finally:
+            end_time = time.time()
+            if success: self._log(f"Подготовка завершена за {end_time - start_time:.2f} сек."); self.status_callback("Изображение обработано.")
+            else: self._log("Подготовка не удалась.")
+
+            self._log("Вызов pixel_update_callback...")
+            if self.pixel_update_callback: self.pixel_update_callback()
+            self._log("Колбэки вызваны.")
+        return success
+
+    def pick_color(self, hex_color: str):
+        try:
+            clean_hex = hex_color.lstrip('#')
+            self._log(f"Выбор цвета: {clean_hex}") 
+
+            interception.move_to(self.HEX_INPUT_COORD[0], self.HEX_INPUT_COORD[1])
+            time.sleep(0.05) 
+            interception.click(button='left')
+
+            time.sleep(0.15) 
+
+            keyboard.send("ctrl+a")
+
+            time.sleep(0.1) 
+
+            keyboard.send("delete") 
+            time.sleep(0.05) 
+
+            keyboard.write(clean_hex) 
+
+            time.sleep(0.1) 
+
+            keyboard.send("enter")
+
+            time.sleep(0.2) 
+
+        except Exception as e:
+            self._log(f"Ошибка выбора цвета {hex_color}: {e}", True); self.stop_flag = True; self.drawing_enabled = False
+            self.status_callback(f"Ошибка выбора цвета! Рисование остановлено.")
+
+    def draw_line(self, x1, y1, x2, y2):
+        dx=x2-x1; dy=y2-y1; dist=max(abs(dx), abs(dy)); steps=int(dist)
+        if steps==0: return
+        for i in range(1, steps+1):
+            while not self.drawing_enabled and not self.stop_flag: time.sleep(0.005)
+            if self.stop_flag: break
+            xi=int(x1+dx*i/steps); yi=int(y1+dy*i/steps); interception.move_to(xi, yi)
+
+            if self.DRAW_DELAY > 0: time.sleep(self.DRAW_DELAY)
+
+    def flood_fill_draw(self, mask, start_row, start_col, x0, y0):
+        if self.drawn_mask is None: return
+        brush=self.BRUSH_SIZE
+        if not (0<=start_row<mask.shape[0] and 0<=start_col<mask.shape[1]) or mask[start_row, start_col]==0: return
+
+        start_x=x0+start_col*brush+brush//2
+        start_y=y0+start_row*brush+brush//2
+        stack=[(start_row, start_col)]
+
+        interception.move_to(start_x, start_y); time.sleep(0.05)
+        interception.mouse_down("left"); time.sleep(0.05)
+        mouse_is_down = True
+
+        resumed_just_now = False 
+
+        mask[start_row, start_col]=0
+        if not self.drawn_mask[start_row, start_col]: self.drawn_mask[start_row, start_col]=True; self.pixel_update_callback()
+
+        last_x, last_y = start_x, start_y
+
+        while stack and not self.stop_flag:
+
+            if not self.drawing_enabled: 
+                if mouse_is_down: 
+                    interception.mouse_up("left") 
+                    mouse_is_down = False
+                    self._log("Paused, mouse button released.") 
+                    time.sleep(0.01)
+
+                while not self.drawing_enabled and not self.stop_flag:
+                    time.sleep(0.01)
+
+                if self.drawing_enabled and not self.stop_flag:
+
+                    resumed_just_now = True
+                    self._log("Resumed, mouse button is still UP.") 
+
+            if self.stop_flag: break 
+
+            row, col = stack.pop()
+            next_x=x0+col*brush+brush//2
+            next_y=y0+row*brush+brush//2
+
+            if resumed_just_now:
+
+                 self._log(f"Repositioning mouse to {last_x}, {last_y} after pause.")
+                 interception.move_to(last_x, last_y) 
+                 time.sleep(0.05) 
+                 interception.mouse_down("left") 
+                 mouse_is_down = True
+                 resumed_just_now = False 
+                 self._log("Mouse button pressed DOWN after repositioning.")
+                 time.sleep(0.05) 
+            elif not mouse_is_down:
+
+                self._log("[WARN] Mouse was up unexpectedly! Repositioning and pressing down.", True)
+                interception.move_to(last_x, last_y)
+                time.sleep(0.05)
+                interception.mouse_down("left")
+                mouse_is_down = True
+                time.sleep(0.05)
+
+            self.draw_line(last_x, last_y, next_x, next_y)
+            last_x, last_y = next_x, next_y 
+
+            for d in self.neighbor_order:
+                dr, dc = self.neighbor_mapping[d]
+                nr, nc = row+dr, col+dc
+                if 0<=nr<mask.shape[0] and 0<=nc<mask.shape[1]:
+                    if mask[nr, nc] == 255:
+                        mask[nr, nc] = 0
+                        stack.append((nr, nc))
+                        if not self.drawn_mask[nr, nc]:
+                            self.drawn_mask[nr, nc]=True
+                            self.pixel_update_callback()
+
+        if mouse_is_down:
+            interception.mouse_up("left")
+            self._log("Fill finished or stopped, mouse button released.")
+
+    def draw_current_color(self):
+
+        if self.draw_region is None or not self.color_palette or self.cluster_map is None or self.drawn_mask is None: return
+        if self.current_color_index >= len(self.color_palette): return
+        x0, y0, w, h = self.draw_region; hex_color, cluster_id, pcount, _ = self.color_palette[self.current_color_index]
+        self._log(f"[DRAW {self.current_color_index+1}/{len(self.color_palette)}] Цвет {hex_color} (ID:{cluster_id}, ~{pcount}px)...")
+        self.status_callback(f"Рисуем {self.current_color_index+1}/{len(self.color_palette)}: {hex_color}")
+        self.pick_color(hex_color);
+        if self.stop_flag: return
+        cmask = (self.cluster_map == cluster_id) & (~self.drawn_mask); mask_u8 = cmask.astype(np.uint8) * 255
+        contours, _ = cv2.findContours(mask_u8.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            self._log(f"Для цвета {hex_color} нет не нарисованных областей."); self.drawn_mask[self.cluster_map == cluster_id] = True
+            if self.pixel_update_callback: self.pixel_update_callback(); return
+        self._log(f"Найдено {len(contours)} областей для {hex_color}."); pcontours = 0
+        for i, cnt in enumerate(contours):
+            if self.stop_flag: break
+            if cnt is not None and len(cnt) > 0:
+                sp = cnt[0][0]; sc, sr = sp[0], sp[1]
+                self.flood_fill_draw(mask_u8, sr, sc, x0, y0); pcontours += 1
+            else: self._log(f" Пропуск области {i+1}: некорректный контур.")
+        self.drawn_mask[self.cluster_map == cluster_id] = True; self.pixel_update_callback()
+        self._log(f"Завершена обработка {hex_color}. Обработано {pcontours} областей.")
+
+    def draw_image(self):
+
+        if self.draw_region is None or not self.color_palette or self.cluster_map is None:
+            self._log("Невозможно начать: нет области/изображения/палитры.", True); self.status_callback("Ошибка: Нет области или изображения."); return False
+        if self.drawing_enabled: self.drawing_enabled=False; self._log("Пауза."); self.status_callback("Пауза."); return False
+        else:
+            self.drawing_enabled=True; self.stop_flag=False; self._log("Старт/Возобновление."); self.status_callback("Рисование...")
+            if self.drawing_thread is None or not self.drawing_thread.is_alive():
+                if self.current_color_index >= len(self.color_palette) and len(self.color_palette)>0:
+                    self._log("Уже завершено.", True); self.status_callback("Завершено."); self.drawing_enabled=False; return False
+                self.drawing_thread=threading.Thread(target=self.draw_colors_thread, daemon=True); self.drawing_thread.start()
+            return True
+
+    def draw_colors_thread(self):
+
+        self._log("Поток рисования запущен.")
+        while self.current_color_index < len(self.color_palette) and not self.stop_flag:
+            while not self.drawing_enabled and not self.stop_flag: time.sleep(0.1)
+            if self.stop_flag: self._log("Остановка потока по флагу."); break
+            self.draw_current_color()
+            if self.stop_flag: self._log("Остановка потока после цвета."); break
+            self.current_color_index += 1
+        if self.stop_flag: self._log("Поток остановлен."); self.status_callback("drawing_stopped")
+        elif self.current_color_index >= len(self.color_palette):
+            self._log("Поток завершен."); self.status_callback("drawing_complete"); self.drawing_enabled = False
+        else: self._log("Поток завершился неожиданно.", True)
+
+    def get_remaining_pixel_count(self): 
+        if self.drawn_mask is None: return 0, 0
+        t = self.drawn_mask.size; d = np.count_nonzero(self.drawn_mask); return t - d, t
+    def stop_script(self): 
+        self.stop_flag = True; self.drawing_enabled = False; self._log("Получен сигнал стоп.")
+    def register_hotkeys(self, reset_callback, stop_callback): 
+        try: keyboard.add_hotkey('F1',self.select_area); keyboard.add_hotkey('F2',self.draw_image); keyboard.add_hotkey('F3',stop_callback); keyboard.add_hotkey('F4',reset_callback); self._log("Горячие клавиши: F1(Обл), F2(Старт/Пауза), F3(Стоп), F4(Сброс)")
+        except Exception as e: self._log(f"Hotkey error: {e}.", True)
+    def reset(self): 
+        self._log("Сброс OlegPainter..."); self.stop_flag=True; self.drawing_enabled=False
+        if self.drawing_thread and self.drawing_thread.is_alive(): self._log("Ждем поток..."); self.drawing_thread.join(2.0); self._log("Поток завершен." if not self.drawing_thread.is_alive() else "Поток ЗАВИС!", True)
+        self.drawing_thread=None; self.color_palette=[]; self.current_color_index=0; self.drawn_mask=None; self.cluster_map=None; self.image_rgb=None; self.stop_flag=False
+        if self.status_callback: self.status_callback("reset_progress"); 
+        self._log("Сброс OlegPainter завершен.")
+    def cleanup_before_exit(self): 
+        self._log("Очистка OlegPainter..."); self.stop_flag=True; self.drawing_enabled=False
+        if self.drawing_thread and self.drawing_thread.is_alive(): self.drawing_thread.join(1.5)
+        try: keyboard.remove_all_hotkeys(); self._log("Хоткеи сняты.")
+        except Exception as e: self._log(f"Hotkey removal error: {e}", True)
+        try: interception.destroy_context(); self._log("Interception освобожден.")
+        except Exception as e: self._log(f"Interception destroy error: {e}", True)
+        self._log("Очистка OlegPainter завершена.")
+
+class OlegPainterGUI:
+    def __init__(self, master, painter: OlegPainter):
+        self.master = master
+        self.painter = painter
+
+        self.painter.status_callback = self.update_status
+        self.painter.pixel_update_callback = self._update_progress_display
+
+        master.title("OlegPainter Lite 1.0") 
+        master.configure(bg="#2e2e2e")
+
+        try:
+            icon_path = 'icon.ico'
+            if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'): base_path = sys._MEIPASS
+            else: base_path = os.path.abspath(".")
+            icon_full_path = os.path.join(base_path, icon_path)
+            if os.path.exists(icon_full_path): master.iconbitmap(icon_full_path)
+            else: print(f"[GUI WARN] Icon not found: {icon_full_path}")
+        except Exception as e: print(f"[GUI WARN] Icon error: {e}")
+        self.default_font = tkFont.nametofont("TkDefaultFont"); self.default_font.configure(size=9, family="Segoe UI")
+        master.option_add("*Font", self.default_font); self.bold_font = tkFont.Font(family="Segoe UI", size=9, weight="bold")
+        style = ttk.Style();
+        try: style.theme_use('clam')
+        except tk.TclError: style.theme_use('default')
+        bg_color="#2e2e2e"; frame_bg="#3e3e3e"; text_color="white"; button_bg="#555555"; button_fg="white"
+        button_active_bg="#656565"; button_pressed_bg="#454545"; disabled_fg="#999999"; progress_trough=frame_bg; progress_bar_color="#4CAF50"
+        style.configure(".", background=bg_color, foreground=text_color, font=self.default_font, borderwidth=0, focuscolor=bg_color)
+        style.configure("TFrame", background=bg_color); style.configure("TLabel", background=bg_color, foreground=text_color)
+        style.configure("TLabelframe", background=bg_color, foreground=text_color, borderwidth=1, relief="groove"); style.configure("TLabelframe.Label", background=bg_color, foreground=text_color, font=self.bold_font)
+        style.configure("TRadiobutton", background=bg_color, foreground=text_color, padding=(5, 2), indicatorrelief=tk.FLAT); style.map("TRadiobutton", background=[('active', frame_bg)], indicatorcolor=[('selected', progress_bar_color), ('!selected', frame_bg)], foreground=[('disabled', disabled_fg)])
+        style.configure("Dark.TButton", padding=6, relief=tk.FLAT, background=button_bg, foreground=button_fg, borderwidth=0, font=self.default_font, focuscolor=button_bg); style.map("Dark.TButton", background=[('pressed', '!disabled', button_pressed_bg), ('active', '!disabled', button_active_bg), ('disabled', frame_bg)], foreground=[('disabled', disabled_fg)])
+        style.configure("custom.Horizontal.TProgressbar", troughcolor=progress_trough, background=progress_bar_color, thickness=15, borderwidth=0)
+
+        self.frame = ttk.Frame(master, padding=(10, 10)); self.frame.pack(fill=tk.BOTH, expand=True)
+        pad_y = 4; pad_x = 5
+
+        control_frame = ttk.LabelFrame(self.frame, text=" Управление ", style="TLabelframe"); control_frame.pack(fill=tk.X, pady=(0, pad_y*2), padx=pad_x)
+        self.btn_select_image = ttk.Button(control_frame, text="Выбрать изображение", command=self.select_image, style="Dark.TButton"); self.btn_select_image.pack(pady=pad_y, padx=pad_x, fill=tk.X)
+        self.btn_select_area = ttk.Button(control_frame, text="Область (F1)", command=self.painter.select_area, style="Dark.TButton"); self.btn_select_area.pack(pady=pad_y, padx=pad_x, fill=tk.X)
+        self.btn_draw = ttk.Button(control_frame, text="Старт/Пауза (F2)", command=self.toggle_drawing, style="Dark.TButton"); self.btn_draw.pack(pady=pad_y, padx=pad_x, fill=tk.X)
+        self.btn_reset = ttk.Button(control_frame, text="Сброс (F4)", command=self.reset_painter_gui, style="Dark.TButton"); self.btn_reset.pack(pady=pad_y, padx=pad_x, fill=tk.X)
+        self.btn_stop = ttk.Button(control_frame, text="Стоп/Выход (F3)", command=self.stop_script, style="Dark.TButton"); self.btn_stop.pack(pady=pad_y, padx=pad_x, fill=tk.X)
+
+        settings_frame = ttk.LabelFrame(self.frame, text=" Настройки ", style="TLabelframe"); settings_frame.pack(fill=tk.X, pady=(0, pad_y*2), padx=pad_x)
+        mode_frame = ttk.Frame(settings_frame, style="TFrame"); mode_frame.pack(fill=tk.X, pady=pad_y, padx=pad_x)
+        ttk.Label(mode_frame, text="Режим:", style="TLabel").pack(side=tk.LEFT, padx=(0, 10))
+        self.mode_var = tk.StringVar(value=self.painter.mode); mode_options = [("Цветной", "color"), ("Черно-белый", "bw")]
+        self.radio_frame = ttk.Frame(mode_frame, style="TFrame"); self.radio_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.mode_radios = []
+        for i, (text, value) in enumerate(mode_options): rb = ttk.Radiobutton(self.radio_frame, text=text, value=value, variable=self.mode_var, command=self.change_mode, style="TRadiobutton"); rb.grid(row=0, column=i, sticky=tk.W, padx=5, pady=1); self.mode_radios.append(rb)
+
+        self.image_path_label = ttk.Label(self.frame, text="Изображение не выбрано", anchor="w", wraplength=350); self.image_path_label.pack(pady=(pad_y, 0), padx=pad_x, fill=tk.X)
+        if self.painter.IMAGE_PATH: self.update_image_path_label()
+
+        progress_frame = ttk.Frame(self.frame, style="TFrame"); progress_frame.pack(fill=tk.X, pady=(pad_y*2, 0), padx=pad_x)
+        self.progress_label = ttk.Label(progress_frame, text="Прогресс: 0%", width=18, anchor='w'); self.progress_label.pack(side=tk.LEFT)
+        self.progress_bar = ttk.Progressbar(progress_frame, orient='horizontal', mode='determinate', maximum=100, style="custom.Horizontal.TProgressbar"); self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5,0))
+        self.pixel_progress_label = ttk.Label(self.frame, text="Пикселей: 0 / 0", anchor='w'); self.pixel_progress_label.pack(pady=(4, 0), padx=pad_x, fill=tk.X)
+
+        self.status_label = ttk.Label(self.frame, text="Готов.", anchor='w', relief="sunken", borderwidth=1, padding=(5, 2)); self.status_label.pack(side=tk.BOTTOM, fill=tk.X, pady=(pad_y, 0))
+
+        self._update_progress_display()
+
+        self.master.protocol("WM_DELETE_WINDOW", self.on_closing); self.master.attributes('-topmost', True)
+        master.update_idletasks(); min_w = master.winfo_reqwidth()+20; min_h = master.winfo_reqheight()+20
+        master.minsize(min_w, min_h); master.resizable(True, True); master.geometry(f"+50+50")
+
+        self.settings_widgets_to_lock = [
+
+            self.btn_select_image, self.btn_select_area
+        ] + self.mode_radios
+
+    def _set_controls_state(self, state: str):
+        tk_state = tk.NORMAL if state == 'normal' else tk.DISABLED
+        for widget in self.settings_widgets_to_lock:
+            if widget and widget.winfo_exists():
+                try: widget.config(state=tk_state)
+                except tk.TclError as e: print(f"[GUI WARN] Error setting state for {widget}: {e}")
+
+    def toggle_drawing(self):
+        is_now_drawing = self.painter.draw_image()
+        current_painter_state_is_drawing = self.painter.drawing_enabled
+        if current_painter_state_is_drawing: self._set_controls_state('disabled')
+        else: self._set_controls_state('normal')
+
+    def change_mode(self):
+
+        selected_mode = self.mode_var.get()
+        if self.painter.mode != selected_mode:
+            self.painter.mode = selected_mode; mode_text = 'Цветной' if selected_mode == 'color' else 'Ч/Б'
+            self.update_status(f"Режим: {mode_text}")
+            self.painter._log(f"Mode: {selected_mode}")
+            if self.painter.draw_region and self.painter.IMAGE_PATH: self.painter.prepare_image_and_palette()
+
+    def update_image_path_label(self):
+
+        if self.painter.IMAGE_PATH: self.image_path_label.config(text=f"Изобр.: {os.path.basename(self.painter.IMAGE_PATH)}")
+        else: self.image_path_label.config(text="Изображение не выбрано")
+
+    def select_image(self):
+
+        if self.painter.drawing_enabled: self.update_status("Ошибка: Рисование активно."); return
+        initial_dir = os.path.dirname(self.painter.IMAGE_PATH) if self.painter.IMAGE_PATH else os.path.expanduser("~")
+        file_path = filedialog.askopenfilename(initialdir=initial_dir, title="Выберите изображение", filetypes=[("Image Files", "*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tiff"), ("All Files", "*.*")])
+        if file_path:
+            self.painter.IMAGE_PATH = file_path; self.update_image_path_label(); filename = os.path.basename(file_path)
+            self.update_status(f"Выбрано: {filename}")
+            self.painter._log(f"Selected image: {file_path}")
+            if self.painter.draw_region: self.painter.prepare_image_and_palette()
+
+    def _update_progress_display(self):
+        remaining, total = self.painter.get_remaining_pixel_count()
+        drawn = total - remaining; self.pixel_progress_label.config(text=f"Пикселей: {drawn} / {total}")
+        if total > 0:
+            if self.progress_bar['maximum'] != total: self.progress_bar['maximum'] = total
+            self.progress_bar['value'] = drawn; percentage = int((drawn / total) * 100)
+            self.progress_label.config(text=f"Прогресс: {percentage}%")
+        else:
+            if self.progress_bar['maximum'] != 100: self.progress_bar['maximum'] = 100
+            self.progress_bar['value'] = 0; self.progress_label.config(text="Прогресс: 0%")
+
+    def reset_painter_gui(self):
+        if messagebox.askyesno("Сброс", "Сбросить текущее состояние и прервать рисование?"):
+            self.painter.reset()
+            self.update_status("Состояние сброшено.")
+            self._set_controls_state('normal')
+
+    def stop_script(self):
+
+        if messagebox.askokcancel("Выход", "Остановить скрипт и выйти?"):
+            self.update_status("Остановка скрипта..."); self.painter.stop_script(); self.master.destroy()
+    def on_closing(self):
+
+        self.update_status("Завершение работы..."); self.painter.cleanup_before_exit(); self.master.destroy()
+    def update_status(self, message): self.master.after(0, self._update_status_safe, message)
+    def _update_status_safe(self, message):
+
+        display_message = ""; fg_color = "white"; unlock_controls = False
+        if isinstance(message, str):
+            if message.startswith("[ERROR]"): display_message=message[len("[ERROR] "):]; fg_color="#FF6B6B"
+            elif message.startswith("[WARN]"): display_message=message[len("[WARN] "):]; fg_color="#FFD166"
+            elif message.startswith("[INFO]"): display_message=message[len("[INFO] "):]; fg_color="white"
+            elif message == "reset_progress": self._update_progress_display(); display_message="Состояние сброшено."; unlock_controls = True
+            elif message == "drawing_complete": display_message="Рисование завершено!"; fg_color="#90EE90"; messagebox.showinfo("Завершено", "Рисование завершено!"); self._update_progress_display(); unlock_controls = True
+            elif message == "drawing_stopped": display_message="Рисование остановлено."; fg_color="orange"; unlock_controls = True
+            else: display_message = message; fg_color = "white"
+            status_text = display_message.split('\n')[0]
+            if len(status_text) > 120: status_text = status_text[:117] + "..."
+            self.status_label.config(text=status_text, foreground=fg_color)
+            if unlock_controls and not self.painter.drawing_enabled: self._set_controls_state('normal')
+        else: self.status_label.config(text=str(message), foreground="white")
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    painter = OlegPainter()
+    app = OlegPainterGUI(root, painter)
+    painter.register_hotkeys(app.reset_painter_gui, app.stop_script)
+    root.mainloop()
+    print("GUI closed. Program terminated.")
